@@ -1,0 +1,136 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import socket,sys,thread,select,re,time
+
+buffersize = 4096
+server_port = 8080
+
+thruput_curr = float(10)
+
+log = sys.argv[1]                   # e.g. log.txt
+alpha = float(sys.argv[2])          # e.g. alpha=0.5
+listen_port = int(sys.argv[3])      # e.g. 8000
+fake_ip = sys.argv[4]               # e.g. 1.0.0.1
+webserver_ip = sys.argv[5]          # e.g. 4.0.0.
+
+
+def main():
+    print('[Usage]: ./proxy <log> <alpha> <listen-port> <fake-ip> <server-ip>')
+    listen_skt = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listen_skt.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+    listen_skt.bind(('', listen_port))
+    listen_skt.listen(3)
+    print('start listening...')
+
+    while 1:
+        connection_skt, addr = listen_skt.accept()
+        try: 
+            thread.start_new_thread(handler, (connection_skt, addr))
+        except socket.error:
+            connection_skt.close()
+    return    
+
+
+def handler(connection_skt, addr):
+    global buffersize, server_port, alpha, fake_ip, webserver_ip, log, thruput_curr, thruput_new
+    data_f_client = connection_skt.recv(1024) 
+
+    if data_f_client is not None:
+        skt_to_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        skt_to_server.bind((fake_ip,0))
+        skt_to_server.connect(( webserver_ip, server_port))
+
+    if(data_f_client.find('GET') >= 0):
+
+        if data_f_client.find('bitrate') is not None:
+            allowed_bitrate = modify_bitrate(thruput_curr)
+
+        data_f_client = modify_to_sent(data_f_client, allowed_bitrate)
+        chunkname = data_f_client.split(' ')[1]
+        ts = time.time() # time start
+        skt_to_server.send(data_f_client)
+        # print(data_f_client)
+
+    recv_size = 0
+    chunk_len = receive_buff(recv_size, connection_skt, skt_to_server)
+    # print(chunk_len)
+    tf = time.time()    # time ends receive
+
+    thruput_new = float(8 * chunk_len/(tf - ts)/1000)
+    thruput_curr = float(alpha * thruput_new + (1-alpha) * thruput_curr)
+
+    log2write = str(int(time.time())) + ' ' + str(tf-ts) + ' ' + '%.1f' %thruput_new + ' ' + '%.1f' %thruput_curr + ' ' + str(allowed_bitrate) +' ' + str(webserver_ip) +' '+ chunkname +'\n'
+
+    print(log2write)
+    logfile = open(log, 'a')
+    logfile.write(log2write)
+    logfile.close()
+
+    skt_to_server.close()
+    connection_skt.close()
+    return 
+
+
+def modify_bitrate(thruput):
+    max_allowed_thruput = float(thruput)/float(1.5)
+    f4mfile = open('/var/www/vod/big_buck_bunny.f4m', 'r' ) 
+    f4m = f4mfile.read()
+    bitrate_list = []
+    check = [m.start() for m in re.finditer('bitrate=',f4m)]
+
+    for index in check:
+        avaliable_bit = int(f4m[index+9:].split('"')[0])
+        bitrate_list.append(avaliable_bit)
+
+    bitrate_list.append(max_allowed_thruput)
+    bitrate_list.sort()
+    index = bitrate_list.index(max_allowed_thruput)
+    if index == 0:
+        allowed_bitrate = bitrate_list[1]
+    else:
+        allowed_bitrate = bitrate_list[index - 1]
+    return allowed_bitrate
+
+
+def modify_to_sent(data, bitrate):
+    global buffersize, server_port, alpha, fake_ip, webserver_ip, log
+    if data.find('GET /vod/big_buck_bunny.f4m') != -1:
+        data = re.sub('GET /vod/big_buck_bunny.f4m', 'GET /vod/big_buck_bunny_nolist.f4m', data)
+    if (data.find('vod') != -1) and (data.find('Seg') != -1):
+        # allowed_bitrate = modify_bitrate(data)
+        data = re.sub('/vod/([0-9]+)Seg','/vod/' + str(bitrate) + 'Seg', data)
+    return data
+
+
+# buffer the data from server
+def receive_buff(recv_size, conn_skt, ser_skt):
+    global buffersize
+    r, w, e = select.select([ser_skt, ], [], [])
+    while 1:
+        if recv_size == 0:
+            data_f_server = ser_skt.recv(buffersize)
+            if data_f_server is not None:
+                recv_size = len(data_f_server)
+                index = data_f_server.find('Content-Length: ')
+                if index != -1:
+                    reg = re.compile("Content-Length:(.*?)\r\n")
+                    check = re.findall(reg, data_f_server)
+                    if check is not None:
+                        content_len = check[0]
+                        header_len = len(data_f_server.split('\r\n\r\n')[0])
+                    chunk_len = int(content_len) + int(header_len) + 4
+                conn_skt.send(data_f_server)
+        elif recv_size < chunk_len:
+            data_f_server = ser_skt.recv(buffersize)
+            recv_size += len(data_f_server)
+            conn_skt.send(data_f_server)
+        else:
+            break  
+    return chunk_len
+
+if (__name__ == '__main__'):
+    main()
+
+
+
